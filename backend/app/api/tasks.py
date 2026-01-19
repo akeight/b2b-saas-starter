@@ -20,7 +20,7 @@ def list_tasks(
     return tasks
 
 @router.post("", response_model=TaskResponse)
-def list_tasks(
+def create_task(
     task_data: TaskCreate,
     user: AuthUser = Depends(require_create), 
     db: Session = Depends(get_db)
