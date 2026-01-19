@@ -1,21 +1,16 @@
-import httpx
 from fastapi import HTTPException, Depends, Request, status
-from clerk_backend_api.security import AuthenticationRequestOptions
-from app.core.clerk import clerk
-from app.core.config import settings
+from stytch.core.response_base import StytchError
 
-#frontend (jwt token from clerk) -> backend
-#backend authenticates the token
-#gets user details from clerk
-#check user permissions
+from app.core.stytch import stytch_client
+
 
 class AuthUser:
     def __init__(self, user_id: str, org_id: str, org_permissions: list[str]):
         self.user_id = user_id
         self.org_id = org_id
-        self.org_persissions = org_permissions
+        self.org_permissions = org_permissions
 
-    def has_permissions(self, permission: str) -> bool:
+    def has_permission(self, permission: str) -> bool:
         return permission in self.org_permissions
 
     @property
@@ -34,38 +29,54 @@ class AuthUser:
     def can_delete(self) -> bool:
         return self.has_permission("org:tasks:delete")
 
-def convert_to_httpx_request(fastapi_request: Request) -> httpx.Request:
-    return httpx.Request(
-        method=fastapi_request.method,
-        url=str(fastapi_request.url),
-        headers=dict(fastapi_request.headers)
-    )
+
+def _extract_bearer_token(request: Request) -> str:
+    auth_header = request.headers.get("Authorization") or ""
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+        )
+    return token
+
 
 async def get_current_user(request: Request) -> AuthUser:
-    httpx_request = convert_to_httpx_request(request)
+    session_jwt = _extract_bearer_token(request)
 
-    request_state = clerk.authenticate_request(
-        httpx_request,
-        AuthenticationRequestOptions(
-            authorized_parties=[settings.FRONTEND_URL]
+    try:
+        auth_resp = stytch_client.sessions.authenticate(session_jwt=session_jwt)
+    except StytchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+        ) from exc
+
+    user_id = getattr(auth_resp, "member_id", None)
+    org_id = getattr(auth_resp, "organization_id", None)
+
+    # Try to pull permissions from the session JWT payload or custom claims.
+    org_permissions: list[str] = []
+    member_session = getattr(auth_resp, "member_session", None)
+    if member_session:
+        custom_claims = getattr(member_session, "custom_claims", {}) or {}
+        org_permissions = (
+            custom_claims.get("org_permissions")
+            or custom_claims.get("permissions")
+            or []
         )
-    )   
-
-    if not request_state.is_signed_in:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-
-    claims = request_state.payload
-    user_id = claims.get("sub")
-    org_id = claims.get("org_id")
-    org_permissions = claims.get("org_permissions", []) or claims.get("permissions", []) or []
 
     if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User ID not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User ID not found"
+        )
 
     if not org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No organization selected")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No organization selected"
+        )
 
-    return AuthUser(user_id=user_id, org_id=org_id, org_persissions=org_permissions)
+    return AuthUser(user_id=user_id, org_id=org_id, org_permissions=org_permissions)
 
 def require_view(user: AuthUser = Depends(get_current_user)) -> AuthUser:
     if not user.can_view:
